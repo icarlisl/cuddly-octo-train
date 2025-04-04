@@ -8,111 +8,106 @@ import numpy as np
 
 class RedBallTracker(Node):
     def __init__(self):
-        super().__init__('red_ball_tracker')
+        super().__init__('ball_follower')
         
-        # Subscribers and Publishers
-        self.subscription = self.create_subscription(
-            Image, '/camera/image_raw', self.image_callback, 10)
-        self.cmd_vel_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.camera_subscriber = self.create_subscription(Image, '/camera/image_raw', self.process_image, 10)
+        self.velocity_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
         
-        # Image Processing
-        self.bridge = CvBridge()
-        self.frame_center = None
+        self.cv_bridge = CvBridge()
         
-        # Control Parameters
-        self.target_width = 100  # pixels (adjust based on desired following distance)
-        self.target_center_tolerance = 20  # pixels
+        self.color_mins = np.array([0, 150, 150]) # hue, saturation, value
+        self.color_maxs = np.array([10, 255, 255])
         
-        # PID Constants
-        self.kp_linear = 0.004
-        self.kp_angular = 0.01
-        self.kd_linear = 0.001
-        self.kd_angular = 0.005
+        # robot control parameters
+        self.screen_center_location = None
+        self.target_ball_size = 100
+        self.speed = 0.1
+        self.buffer_zone = 60  # prevent oscillations
         
-        # State variables
-        self.prev_error_linear = 0
-        self.prev_error_angular = 0
-        
-        # Debug window
-        cv2.namedWindow('Ball Tracking', cv2.WINDOW_NORMAL)
+        # pid parameters
+        self.kp = 0.0008  
+        self.ki = 0.0001  
+        self.kd = 0.0002  
+  
+        self.previous_error = 0.0
+        self.integral = 0.0
+        self.max_turn_speed = 0.18
 
-    def image_callback(self, msg):
+        cv2.namedWindow('Robot View')
+        
+    def detect_ball(self, frame):
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV) # converts camera view into hsv view to determine colors
+        red = cv2.inRange(hsv, self.color_mins, self.color_maxs)
+      
+        contours, _ = cv2.findContours(red, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if contours:
+            ball_area = max(contours, key=cv2.contourArea)
+            x, y, w, h = cv2.boundingRect(ball_area)
+            return (True, x, y, w, h)
+        
+        return (False, 0, 0, 0, 0)
+
+
+    def process_image(self, msg):
         try:
-            frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
-            if self.frame_center is None:
-                self.frame_center = (frame.shape[1]//2, frame.shape[0]//2)
-        except Exception as e:
-            self.get_logger().error(f"Image processing error: {e}")
+            camera_frame = self.cv_bridge.imgmsg_to_cv2(msg, 'bgr8')
+            if self.screen_center_location is None: # first round to set location of center of screen
+                screen_width = camera_frame.shape[1]
+                self.screen_center_location = screen_width // 2
+        except:
             return
 
-        # Ball detection logic
-        ball_found, x, y, w, h = self.detect_red_ball(frame)
-        cmd_vel = Twist()
+        velocity = Twist()
+        ball_found, x, y, w, h = self.detect_ball(camera_frame)
         
         if ball_found:
-            # Calculate control signals
-            error_linear = w - self.target_width
-            error_angular = (x + w/2) - self.frame_center[0]
+            ball_center = x + (w // 2)
+            center_error = self.screen_center_location - ball_center
             
-            # PID control with derivative term
-            cmd_vel.linear.x = self.kp_linear * error_linear + self.kd_linear * (error_linear - self.prev_error_linear)
-            cmd_vel.angular.z = -self.kp_angular * error_angular - self.kd_angular * (error_angular - self.prev_error_angular)
+            # distance from ball
+            if w > self.target_ball_size + 10: # 10 for oscillations
+                velocity.linear.x = -self.speed * 0.4
+            elif w < self.target_ball_size - 10:
+                velocity.linear.x = self.speed
+            else:
+                velocity.linear.x = 0.0
+
+            if abs(center_error) > self.buffer_zone:
+                self.integral += center_error
+                self.derivative = center_error - self.previous_error
+                
+                # controller
+                turning_control = (self.kp * center_error) + (self.ki * self.integral) + (self.kd * self.derivative)
+                
+                self.previous_error = center_error
+                
+                turning_control = max(min(turning_control, self.max_turn_speed), -self.max_turn_speed) # troubleshooting
+                velocity.angular.z = turning_control
+                
+            else: # clears PID components when in buffer zone and stops robot
+                self.integral = 0.0
+                self.previous_error = 0.0
+                velocity.angular.z = 0.0
+
+            cv2.rectangle(camera_frame, (x, y), (x+w, y+h), (0,255,0), 2)
             
-            # Save previous errors
-            self.prev_error_linear = error_linear
-            self.prev_error_angular = error_angular
-            
-            # Draw debug info
-            cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2)
-            cv2.circle(frame, self.frame_center, 5, (255, 0, 0), -1)
-        else:
-            # Stop if no ball detected
-            cmd_vel.linear.x = 0.0
-            cmd_vel.angular.z = 0.0
-            self.prev_error_linear = 0
-            self.prev_error_angular = 0
+        else: # clears PID components when ball is lost and looks for ball
+            self.integral = 0.0
+            self.previous_error = 0.0
+            velocity.angular.z = 0.4  
 
-        self.cmd_vel_pub.publish(cmd_vel)
-        cv2.imshow('Ball Tracking', frame)
-        cv2.waitKey(1)
+        self.velocity_publisher.publish(velocity)
+        cv2.imshow('Robot View', camera_frame)
+        cv2.waitKey(1) # cv thing
 
-    def detect_red_ball(self, frame):
-        # Resize for faster processing
-        frame = cv2.resize(frame, (640, 360))
-        
-        # HSV color thresholding
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        lower_red = np.array([0, 120, 70])
-        upper_red = np.array([10, 255, 255])
-        mask = cv2.inRange(hsv, lower_red, upper_red)
-        
-        # Noise reduction
-        kernel = np.ones((5,5), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        
-        # Find contours
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if contours:
-            largest = max(contours, key=cv2.contourArea)
-            x, y, w, h = cv2.boundingRect(largest)
-            return True, x, y, w, h
-        return False, 0, 0, 0, 0
-
-    def __del__(self):
-        cv2.destroyAllWindows()
 
 def main(args=None):
     rclpy.init(args=args)
-    node = RedBallTracker()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        # Stop robot before exiting
-        node.cmd_vel_pub.publish(Twist())
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
+    red_ball_tracker = RedBallTracker()
+    rclpy.spin(red_ball_tracker)
+    red_ball_tracker.destroy_node()
+    rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
